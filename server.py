@@ -14,6 +14,8 @@ def connect():
     DB.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB)
     con.execute('CREATE TABLE IF NOT EXISTS races (id INTEGER PRIMARY KEY, payload TEXT NOT NULL, updated TEXT DEFAULT CURRENT_TIMESTAMP)')
+    con.execute('CREATE TABLE IF NOT EXISTS horses (id INTEGER PRIMARY KEY, name TEXT NOT NULL, payload TEXT NOT NULL, updated TEXT DEFAULT CURRENT_TIMESTAMP)')
+    con.execute('CREATE TABLE IF NOT EXISTS jockeys (id INTEGER PRIMARY KEY, name TEXT NOT NULL, payload TEXT NOT NULL, updated TEXT DEFAULT CURRENT_TIMESTAMP)')
     return con
 
 def validate(race):
@@ -40,6 +42,51 @@ def validate(race):
             if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= 10):
                 raise ValueError('Les évaluations doivent être comprises entre 0 et 10.')
     return race
+
+def validate_horse(horse):
+    if not isinstance(horse, dict):
+        raise ValueError('La fiche cheval est invalide.')
+    horse['name'] = str(horse.get('name', '')).strip()
+    if not horse['name']:
+        raise ValueError('Le nom du cheval est obligatoire.')
+    scores = horse.get('scores', {})
+    if not isinstance(scores, dict):
+        raise ValueError('Les critères Gérard sont invalides.')
+    valid_keys = {key for key, _, _ in CRITERIA}
+    for key, value in scores.items():
+        if key not in valid_keys:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f'Le critère {key} est invalide.')
+        if not 0 <= value <= 10:
+            raise ValueError(f'Le critère {key} doit être compris entre 0 et 10.')
+        scores[key] = value
+    horse['scores'] = scores
+    return horse
+
+def validate_jockey(jockey):
+    if not isinstance(jockey, dict):
+        raise ValueError('La fiche jockey est invalide.')
+    jockey['name'] = str(jockey.get('name', '')).strip()
+    if not jockey['name']:
+        raise ValueError('Le nom du jockey est obligatoire.')
+    for key in ('weight', 'age', 'successRate', 'softRate', 'heavyRate', 'shortRate', 'middleRate', 'longRate'):
+        value = jockey.get(key)
+        if value in (None, ''):
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f'La donnée {key} est invalide.')
+        if key == 'age' and not 14 <= value <= 100:
+            raise ValueError("L'âge doit être compris entre 14 et 100 ans.")
+        if key != 'age' and not 0 <= value <= 100:
+            raise ValueError('Les pourcentages doivent être compris entre 0 et 100.')
+        jockey[key] = value
+    jockey['roles'] = [role for role in jockey.get('roles', []) if role in ('jockey', 'trainer', 'owner')]
+    return jockey
 
 def ranking(race):
     weights = {k: race.get('weights', {}).get(k, d) for k, _, d in CRITERIA}
@@ -73,6 +120,14 @@ class Handler(SimpleHTTPRequestHandler):
             with connect() as con:
                 rows = con.execute('SELECT id, payload, updated FROM races ORDER BY id DESC').fetchall()
             return self.reply([dict(json.loads(p), id=i, updated=u) for i, p, u in rows])
+        if self.path == '/api/horses':
+            with connect() as con:
+                rows = con.execute('SELECT id, payload, updated FROM horses ORDER BY updated DESC, id DESC').fetchall()
+            return self.reply([dict(json.loads(p), id=i, updated=u) for i, p, u in rows])
+        if self.path == '/api/jockeys':
+            with connect() as con:
+                rows = con.execute('SELECT id, payload, updated FROM jockeys ORDER BY updated DESC, id DESC').fetchall()
+            return self.reply([dict(json.loads(p), id=i, updated=u) for i, p, u in rows])
         if self.path.startswith('/api/'):
             return self.reply({'error': 'Page inconnue'}, 404)
         super().do_GET()
@@ -82,7 +137,40 @@ class Handler(SimpleHTTPRequestHandler):
             length = int(self.headers.get('Content-Length', 0))
             if not 0 < length <= 1000000:
                 raise ValueError('Requête vide ou trop volumineuse.')
-            race = validate(json.loads(self.rfile.read(length)))
+            data = json.loads(self.rfile.read(length))
+            if self.path == '/api/horses':
+                horse = validate_horse(data)
+                ident = horse.pop('id', None)
+                horse.pop('updated', None)
+                with connect() as con:
+                    payload = json.dumps(horse, ensure_ascii=False, allow_nan=False)
+                    if ident is None:
+                        ident = con.execute('INSERT INTO horses(name, payload) VALUES (?, ?)', (horse['name'], payload)).lastrowid
+                    else:
+                        cursor = con.execute('UPDATE horses SET name=?, payload=?, updated=CURRENT_TIMESTAMP WHERE id=?', (horse['name'], payload, ident))
+                        if not cursor.rowcount:
+                            return self.reply({'error': 'Cheval introuvable'}, 404)
+                    updated = con.execute('SELECT updated FROM horses WHERE id=?', (ident,)).fetchone()[0]
+                horse['id'] = ident
+                horse['updated'] = updated
+                return self.reply(horse, 201)
+            if self.path == '/api/jockeys':
+                jockey = validate_jockey(data)
+                ident = jockey.pop('id', None)
+                jockey.pop('updated', None)
+                with connect() as con:
+                    payload = json.dumps(jockey, ensure_ascii=False, allow_nan=False)
+                    if ident is None:
+                        ident = con.execute('INSERT INTO jockeys(name, payload) VALUES (?, ?)', (jockey['name'], payload)).lastrowid
+                    else:
+                        cursor = con.execute('UPDATE jockeys SET name=?, payload=?, updated=CURRENT_TIMESTAMP WHERE id=?', (jockey['name'], payload, ident))
+                        if not cursor.rowcount:
+                            return self.reply({'error': 'Jockey introuvable'}, 404)
+                    updated = con.execute('SELECT updated FROM jockeys WHERE id=?', (ident,)).fetchone()[0]
+                jockey['id'] = ident
+                jockey['updated'] = updated
+                return self.reply(jockey, 201)
+            race = validate(data)
             if self.path == '/api/rank':
                 return self.reply(ranking(race))
             if self.path != '/api/races':
@@ -100,6 +188,29 @@ class Handler(SimpleHTTPRequestHandler):
             self.reply({'id': ident})
         except (ValueError, TypeError, AttributeError) as exc:
             self.reply({'error': str(exc)}, 400)
+
+    def do_DELETE(self):
+        if self.path.startswith('/api/horses/'):
+            try:
+                ident = int(self.path.rsplit('/', 1)[1])
+            except ValueError:
+                return self.reply({'error': 'Identifiant invalide'}, 400)
+            with connect() as con:
+                cursor = con.execute('DELETE FROM horses WHERE id=?', (ident,))
+            if not cursor.rowcount:
+                return self.reply({'error': 'Cheval introuvable'}, 404)
+            return self.reply({'deleted': ident})
+        if not self.path.startswith('/api/jockeys/'):
+            return self.reply({'error': 'Page inconnue'}, 404)
+        try:
+            ident = int(self.path.rsplit('/', 1)[1])
+        except ValueError:
+            return self.reply({'error': 'Identifiant invalide'}, 400)
+        with connect() as con:
+            cursor = con.execute('DELETE FROM jockeys WHERE id=?', (ident,))
+        if not cursor.rowcount:
+            return self.reply({'error': 'Jockey introuvable'}, 404)
+        self.reply({'deleted': ident})
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
